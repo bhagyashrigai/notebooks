@@ -1,135 +1,178 @@
-######################################################
-# mongocli-builder (build stage only, not published) #
-######################################################
+#######################################################
+# Stage 1: mongocli-builder
+#######################################################
 FROM registry.access.redhat.com/ubi9/go-toolset:latest AS mongocli-builder
 
 ARG MONGOCLI_VERSION=2.0.4
-
 WORKDIR /tmp/
-RUN curl -Lo mongodb-cli-mongocli-v${MONGOCLI_VERSION}.zip https://github.com/mongodb/mongodb-cli/archive/refs/tags/mongocli/v${MONGOCLI_VERSION}.zip
-RUN unzip ./mongodb-cli-mongocli-v${MONGOCLI_VERSION}.zip
-RUN cd ./mongodb-cli-mongocli-v${MONGOCLI_VERSION}/ && \
-    CGO_ENABLED=1 GOOS=linux go build -a -tags strictfipsruntime -o /tmp/mongocli ./cmd/mongocli/
 
-########################
-# base                 #
-########################
+RUN curl -Lo mongodb-cli-mongocli-v${MONGOCLI_VERSION}.zip \
+    https://github.com/mongodb/mongodb-cli/archive/refs/tags/mongocli/v${MONGOCLI_VERSION}.zip && \
+    unzip ./mongodb-cli-mongocli-v${MONGOCLI_VERSION}.zip && \
+    cd ./mongodb-cli-mongocli-v${MONGOCLI_VERSION}/ && \
+    CGO_ENABLED=1 GOOS=linux go build -a -tags strictfipsruntime \
+    -o /tmp/mongocli ./cmd/mongocli/
+
+
+#######################################################
+# Stage 2: base
+#######################################################
 FROM registry.access.redhat.com/ubi9/python-312:latest AS base
 
 WORKDIR /opt/app-root/bin
-
-# OS Packages needs to be installed as root
 USER root
 
-# upgrade first to avoid fixable vulnerabilities begin
-RUN dnf -y upgrade --refresh --best --nodocs --noplugins --setopt=install_weak_deps=0 --setopt=keepcache=0 \
-    && dnf clean all -y
-# upgrade first to avoid fixable vulnerabilities end
+# Upgrade OS and install useful packages
+RUN dnf -y upgrade --refresh --best --nodocs --noplugins \
+    --setopt=install_weak_deps=0 --setopt=keepcache=0 && \
+    dnf install -y mesa-libGL skopeo && \
+    dnf clean all && rm -rf /var/cache/yum
 
-# Install useful OS packages
-RUN dnf install -y mesa-libGL skopeo && dnf clean all && rm -rf /var/cache/yum
-
-# Other apps and tools installed as default user
+# Switch to default user
 USER 1001
 
-# Install micropipenv and uv to deploy packages from requirements.txt begin
+# Install micropipenv and uv
 RUN pip install --no-cache-dir -U "micropipenv[toml]==1.9.0" "uv==0.8.12"
-# Install micropipenv and uv to deploy packages from requirements.txt end
 
-# Install the oc client begin
+# Install oc client
 RUN curl -L https://mirror.openshift.com/pub/openshift-v4/$(uname -m)/clients/ocp/stable/openshift-client-linux.tar.gz \
-        -o /tmp/openshift-client-linux.tar.gz && \
+    -o /tmp/openshift-client-linux.tar.gz && \
     tar -xzvf /tmp/openshift-client-linux.tar.gz oc && \
     rm -f /tmp/openshift-client-linux.tar.gz
-# Install the oc client end
 
-####################
-# jupyter-minimal #
-####################
+
+#######################################################
+# Stage 3: common-builder (for Power-only builds)
+#######################################################
+FROM base AS common-builder
+USER root
+RUN dnf install -y gcc-toolset-13 cmake ninja-build git wget unzip && \
+    dnf clean all
+
+
+#######################################################
+# Stage 4: onnx-builder (Power-only)
+#######################################################
+FROM common-builder AS onnx-builder
+WORKDIR /tmp
+RUN if [ "$(uname -m)" = "ppc64le" ]; then \
+    source /opt/rh/gcc-toolset-13/enable && \
+    git clone --recursive https://github.com/onnx/onnx.git && \
+    cd onnx && git checkout v1.18.0 && \
+    git submodule update --init --recursive && \
+    pip install -r requirements.txt && \
+    export CMAKE_ARGS="-DPython3_EXECUTABLE=$(which python3.12)" && \
+    pip wheel . -w /tmp/onnx_wheel; \
+    else \
+    echo "Skipping ONNX build on non-Power"; \
+    fi
+
+
+#######################################################
+# Stage 5: openblas-builder (Power-only)
+#######################################################
+FROM common-builder AS openblas-builder
+ARG OPENBLAS_VERSION=0.3.30
+WORKDIR /root
+RUN if [ "$(uname -m)" = "ppc64le" ]; then \
+    wget https://github.com/OpenMathLib/OpenBLAS/releases/download/v${OPENBLAS_VERSION}/OpenBLAS-${OPENBLAS_VERSION}.zip && \
+    unzip OpenBLAS-${OPENBLAS_VERSION}.zip && \
+    cd OpenBLAS-${OPENBLAS_VERSION} && \
+    make -j$(nproc) TARGET=POWER9 BINARY=64 USE_OPENMP=1 USE_THREAD=1 NUM_THREADS=120 DYNAMIC_ARCH=1 INTERFACE64=0; \
+    else \
+    echo "Skipping OpenBLAS build on non-Power"; \
+    fi
+
+
+#######################################################
+# Stage 6: jupyter-minimal
+#######################################################
 FROM base AS jupyter-minimal
 
 ARG JUPYTER_REUSABLE_UTILS=jupyter/utils
 ARG MINIMAL_SOURCE_CODE=jupyter/minimal/ubi9-python-3.12
 
 WORKDIR /opt/app-root/bin
-
 COPY ${JUPYTER_REUSABLE_UTILS} utils/
 COPY ${MINIMAL_SOURCE_CODE}/start-notebook.sh ./
 
 USER 0
-
-# Dependencies for PDF export begin
-RUN ./utils/install_pdf_deps.sh
-ENV PATH="/usr/local/texlive/bin/linux:/usr/local/pandoc/bin:$PATH"
-# Dependencies for PDF export end
+# PDF export deps
+# RUN ./utils/install_pdf_deps.sh
+# ENV PATH="/usr/local/texlive/bin/linux:/usr/local/pandoc/bin:$PATH"
 
 USER 1001
-
 WORKDIR /opt/app-root/src
-
 ENTRYPOINT ["start-notebook.sh"]
 
 
-########################
-# jupytyer-datascience #
-########################
+#######################################################
+# Stage 7: jupyter-datascience
+#######################################################
 FROM jupyter-minimal AS jupyter-datascience
 
 ARG DATASCIENCE_SOURCE_CODE=jupyter/datascience/ubi9-python-3.12
+ARG OPENBLAS_VERSION=0.3.30
+ARG ONNX_VERSION=1.18.0
 
 LABEL name="odh-notebook-jupyter-datascience-ubi9-python-3.12" \
-    summary="Jupyter data science notebook image for ODH notebooks" \
-    description="Jupyter data science notebook image with base Python 3.12 builder image based on UBI9 for ODH notebooks" \
-    io.k8s.display-name="Jupyter data science notebook image for ODH notebooks" \
-    io.k8s.description="Jupyter data science notebook image with base Python 3.12 builder image based on UBI9 for ODH notebooks" \
-    authoritative-source-url="https://github.com/opendatahub-io/notebooks" \
-    io.openshift.build.commit.ref="main" \
-    io.openshift.build.source-location="https://github.com/opendatahub-io/notebooks/tree/main/jupyter/datascience/ubi9-python-3.12" \
-    io.openshift.build.image="quay.io/opendatahub/workbench-images:jupyter-datascience-ubi9-python-3.12"
+      summary="Jupyter data science notebook image for ODH notebooks" \
+      description="Jupyter data science notebook image with base Python 3.12 builder image based on UBI9 for ODH notebooks" \
+      io.k8s.display-name="Jupyter data science notebook image for ODH notebooks" \
+      io.k8s.description="Jupyter data science notebook image with base Python 3.12 builder image based on UBI9 for ODH notebooks" \
+      authoritative-source-url="https://github.com/opendatahub-io/notebooks" \
+      io.openshift.build.commit.ref="main" \
+      io.openshift.build.source-location="https://github.com/opendatahub-io/notebooks/tree/main/jupyter/datascience/ubi9-python-3.12" \
+      io.openshift.build.image="quay.io/opendatahub/workbench-images:jupyter-datascience-ubi9-python-3.12"
 
 WORKDIR /opt/app-root/bin
-
-# OS Packages needs to be installed as root
 USER root
 
-# Install useful OS packages
-RUN dnf install -y jq unixODBC postgresql git-lfs libsndfile libxcrypt-compat && dnf clean all && rm -rf /var/cache/yum
+# Install base OS deps
+RUN dnf install -y jq unixODBC postgresql git-lfs libsndfile libxcrypt-compat && \
+    if [ "$(uname -m)" != "ppc64le" ]; then \
+     cp ${DATASCIENCE_SOURCE_CODE}/mssql-2022.repo /etc/yum.repos.d/mssql-2022.repo && \
+     ACCEPT_EULA=Y dnf install -y mssql-tools18 && \
+     export PATH="$PATH:/opt/mssql-tools18/bin"; \
+    fi && \
+    dnf clean all && rm -rf /var/cache/yum
 
-# Copy dynamically-linked mongocli built in earlier build stage
+# Copy mongocli
 COPY --from=mongocli-builder /tmp/mongocli /opt/app-root/bin/
 
-# Install MSSQL Client, We need a special repo for MSSQL as they do their own distribution
-COPY ${DATASCIENCE_SOURCE_CODE}/mssql-2022.repo /etc/yum.repos.d/mssql-2022.repo
+# Copy OpenBLAS for Power
+COPY --from=openblas-builder /root/OpenBLAS-${OPENBLAS_VERSION} /openblas
 
-RUN ACCEPT_EULA=Y dnf install -y mssql-tools18 unixODBC-devel && dnf clean all && rm -rf /var/cache/yum
+# Power-specific ONNX/OpenBLAS installation
+RUN --mount=type=bind,from=onnx-builder,source=/tmp/onnx_wheel/,target=/onnxwheels/,ro \
+    if [ "$(uname -m)" = "ppc64le" ]; then \
+    pip install /onnxwheels/*.whl && \
+    PREFIX=/usr/local make -C /openblas install && \
+    rm -rf /openblas; \
+    else \
+    echo "Skipping ONNX/OpenBLAS install on non-Power"; \
+    fi
 
-ENV PATH="$PATH:/opt/mssql-tools18/bin"
+# Fix perms
+RUN chmod -R g+w /opt/app-root/lib/python3.12/site-packages && \
+    fix-permissions /opt/app-root -P
 
-# Other apps and tools installed as default user
 USER 1001
 
-# Install Python packages and Jupyterlab extensions from requirements.txt
+# Python deps + Elyra setup
 COPY ${DATASCIENCE_SOURCE_CODE}/requirements.txt ./
-# Copy Elyra setup to utils so that it's sourced at startup
 COPY ${DATASCIENCE_SOURCE_CODE}/setup-elyra.sh ${DATASCIENCE_SOURCE_CODE}/utils ./utils/
 
 RUN echo "Installing softwares and packages" && \
-    # This may have to download and compile some dependencies, and as we don't lock requirements from `build-system.requires`,
-    #  we often don't know the correct hashes and `--require-hashes` would therefore fail on non amd64, where building is common.
-    uv pip install --strict --no-deps --no-cache --no-config --no-progress --verify-hashes --compile-bytecode --index-strategy=unsafe-best-match --requirements=./requirements.txt --build-constraints=./requirements.txt && \
-    # setup path for runtime configuration
+    uv pip install --strict --no-deps --no-cache --no-config --no-progress \
+    --verify-hashes --compile-bytecode --index-strategy=unsafe-best-match \
+    --requirements=./requirements.txt --build-constraints=./requirements.txt && \
     mkdir /opt/app-root/runtimes && \
     mkdir /opt/app-root/pipeline-runtimes && \
-    # Remove default Elyra runtime-images \
     rm /opt/app-root/share/jupyter/metadata/runtime-images/*.json && \
-    # Replace Notebook's launcher, "(ipykernel)" with Python's version 3.x.y \
-    sed -i -e "s/Python.*/$(python --version | cut -d '.' -f-2)\",/" /opt/app-root/share/jupyter/kernels/python3/kernel.json && \
-    # Disable announcement plugin of jupyterlab \
+    sed -i -e "s/Python.*/$(python --version | cut -d '.' -f-2)\",/" \
+    /opt/app-root/share/jupyter/kernels/python3/kernel.json && \
     jupyter labextension disable "@jupyterlab/apputils-extension:announcements" && \
-    # Apply JupyterLab addons \
-    /opt/app-root/bin/utils/addons/apply.sh && \
-    # Fix permissions to support pip in Openshift environments \
-    chmod -R g+w /opt/app-root/lib/python3.12/site-packages && \
-    fix-permissions /opt/app-root -P
+    /opt/app-root/bin/utils/addons/apply.sh
 
 WORKDIR /opt/app-root/src
