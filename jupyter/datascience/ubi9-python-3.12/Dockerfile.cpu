@@ -42,46 +42,24 @@ RUN curl -L https://mirror.openshift.com/pub/openshift-v4/$(uname -m)/clients/oc
 
 
 #######################################################
-# Stage 3: common-builder (for Power-only builds)
+# Stage 3: pdf-builder (Power-only TeX + Pandoc)
 #######################################################
-FROM base AS common-builder
+FROM registry.access.redhat.com/ubi9/python-312:latest AS pdf-builder
+
+WORKDIR /opt/app-root/bin
 USER root
-RUN dnf install -y gcc-toolset-13 cmake ninja-build git wget unzip && \
-    dnf clean all
 
+COPY jupyter/utils/install_texlive.sh ./install_texlive.sh
+COPY jupyter/utils/install_pandoc.sh ./install_pandoc.sh
+RUN chmod +x install_texlive.sh install_pandoc.sh
 
-#######################################################
-# Stage 4: onnx-builder (Power-only)
-#######################################################
-FROM common-builder AS onnx-builder
-WORKDIR /tmp
+# Install only on Power (ppc64le)
 RUN if [ "$(uname -m)" = "ppc64le" ]; then \
-    source /opt/rh/gcc-toolset-13/enable && \
-    git clone --recursive https://github.com/onnx/onnx.git && \
-    cd onnx && git checkout v1.18.0 && \
-    git submodule update --init --recursive && \
-    pip install -r requirements.txt && \
-    export CMAKE_ARGS="-DPython3_EXECUTABLE=$(which python3.12)" && \
-    pip wheel . -w /tmp/onnx_wheel; \
+     ./install_texlive.sh && \
+     ./install_pandoc.sh ; \
     else \
-    echo "Skipping ONNX build on non-Power"; \
-    fi
-
-
-#######################################################
-# Stage 5: openblas-builder (Power-only)
-#######################################################
-FROM common-builder AS openblas-builder
-ARG OPENBLAS_VERSION=0.3.30
-WORKDIR /root
-RUN if [ "$(uname -m)" = "ppc64le" ]; then \
-    wget https://github.com/OpenMathLib/OpenBLAS/releases/download/v${OPENBLAS_VERSION}/OpenBLAS-${OPENBLAS_VERSION}.zip && \
-    unzip OpenBLAS-${OPENBLAS_VERSION}.zip && \
-    cd OpenBLAS-${OPENBLAS_VERSION} && \
-    make -j$(nproc) TARGET=POWER9 BINARY=64 USE_OPENMP=1 USE_THREAD=1 NUM_THREADS=120 DYNAMIC_ARCH=1 INTERFACE64=0; \
-    else \
-    echo "Skipping OpenBLAS build on non-Power"; \
-    fi
+     echo "Skipping TeX Live + Pandoc for $(uname -m)" ; \
+   fi
 
 
 #######################################################
@@ -100,6 +78,14 @@ USER 0
 # PDF export deps
 # RUN ./utils/install_pdf_deps.sh
 # ENV PATH="/usr/local/texlive/bin/linux:/usr/local/pandoc/bin:$PATH"
+RUN --mount=type=cache,from=pdf-builder,source=/usr/local/,target=/pdf_builder/,rw \
+    bash -c ' \
+    if [[ "$(uname -m)" == "ppc64le" ]]; then \
+        cp -r /pdf_builder/texlive /usr/local/; \
+        cp -r /pdf_builder/pandoc /usr/local/; \
+    else \
+        ./utils/install_pdf_deps.sh; \
+    fi'
 
 USER 1001
 WORKDIR /opt/app-root/src
@@ -112,7 +98,8 @@ ENTRYPOINT ["start-notebook.sh"]
 FROM jupyter-minimal AS jupyter-datascience
 
 ARG DATASCIENCE_SOURCE_CODE=jupyter/datascience/ubi9-python-3.12
-ARG OPENBLAS_VERSION=0.3.30
+ARG OPENBLAS_VERSION=0.3.29
+ARG LIBPROTOBUF_VERSION=4.25.8
 ARG ONNX_VERSION=1.18.0
 
 LABEL name="odh-notebook-jupyter-datascience-ubi9-python-3.12" \
@@ -129,7 +116,7 @@ WORKDIR /opt/app-root/bin
 USER root
 
 # Install base OS deps
-RUN dnf install -y jq unixODBC postgresql git-lfs libsndfile libxcrypt-compat && \
+RUN dnf install -y jq unixODBC unixODBC-devel postgresql git-lfs libsndfile libxcrypt-compat && \
     if [ "$(uname -m)" != "ppc64le" ]; then \
      cp ${DATASCIENCE_SOURCE_CODE}/mssql-2022.repo /etc/yum.repos.d/mssql-2022.repo && \
      ACCEPT_EULA=Y dnf install -y mssql-tools18 && \
@@ -140,18 +127,22 @@ RUN dnf install -y jq unixODBC postgresql git-lfs libsndfile libxcrypt-compat &&
 # Copy mongocli
 COPY --from=mongocli-builder /tmp/mongocli /opt/app-root/bin/
 
-# Copy OpenBLAS for Power
-COPY --from=openblas-builder /root/OpenBLAS-${OPENBLAS_VERSION} /openblas
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig/
 
-# Power-specific ONNX/OpenBLAS installation
-RUN --mount=type=bind,from=onnx-builder,source=/tmp/onnx_wheel/,target=/onnxwheels/,ro \
-    if [ "$(uname -m)" = "ppc64le" ]; then \
-    pip install /onnxwheels/*.whl && \
-    PREFIX=/usr/local make -C /openblas install && \
-    rm -rf /openblas; \
-    else \
+# Install ONNX, OpenBLAS, libprotobuf from IBM First on Power only and verify
+
+RUN if [ "$(uname -m)" = "ppc64le" ]; then \
+    pip install --prefer-binary \
+    onnx==${ONNX_VERSION} \
+    libprotobuf==${LIBPROTOBUF_VERSION} \
+    openblas==${OPENBLAS_VERSION} \
+    scipy==1.15.3 \
+    scikit-learn==1.6.1 \
+    --extra-index-url=https://wheels.developerfirst.ibm.com/ppc64le/linux && \
+    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/app-root/lib/python3.12/site-packages/openblas/lib:/opt/app-root/lib/python3.12/site-packages/libprotobuf/lib64; \
+   else \
     echo "Skipping ONNX/OpenBLAS install on non-Power"; \
-    fi
+   fi
 
 # Fix perms
 RUN chmod -R g+w /opt/app-root/lib/python3.12/site-packages && \
