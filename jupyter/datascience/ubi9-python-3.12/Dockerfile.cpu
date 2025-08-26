@@ -167,3 +167,4 @@ RUN echo "Installing softwares and packages" && \
     /opt/app-root/bin/utils/addons/apply.sh
 
 WORKDIR /opt/app-root/src
+
